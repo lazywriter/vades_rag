@@ -1,0 +1,24 @@
+# --- training pipeline (train_vades.py and its modules) ---
+torch>=2.0
+numpy
+pandas
+scikit-learn
+beautifulsoup4
+spacy>=3.7
+textstat
+tqdm
+joblib
+tensorflow
+tensorflow-hub
+# tensorflow-text  # uncomment if your USE variant needs it (not required for
+                    # universal-sentence-encoder/4, the one used by default)
+
+# spaCy's English model isn't on PyPI — install separately, e.g.:
+#   python -m spacy download en_core_web_sm
+# or, if that CDN is unreachable from your environment, install the wheel
+# directly from GitHub releases:
+#   pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+
+# --- RAG serving pipeline (style_faiss_index.py, style_recommender.py, query_parser.py, explain.py) ---
+faiss-cpu
+anthropic
