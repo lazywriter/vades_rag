@@ -32,9 +32,6 @@ genre-tagging format.
 
 ## What changed vs. the original notebooks (`vades_main.py` / `vades_recommendation_engine.py`)
 
-- **Training is now a real, runnable script**, not a Colab export. Removed
-  `drive.mount`, `!pip install` magics (see `requirements.txt` instead), and
-  hardcoded `/content/drive/...` paths — everything is a `--flag` now.
 - **Fixed a real ordering bug**: the notebook created `train_loader` /
   `val_loader` / `test_loader` in a cell *before* `DocDataset` was even
   defined. That only worked because Colab runs cells in whatever order you
@@ -42,12 +39,43 @@ genre-tagging format.
   dependency order, so it also runs correctly as a plain linear script — I
   verified this by running it end-to-end against a synthetic corpus (see
   below).
+- **HTML cleaning is now structural, not just regex.** Modern Gutenberg HTML
+  (the "Ebookmaker" format — this is what `pg11870-images.html`, the sample
+  you shared, actually is) wraps its entire license blurb, machine-readable
+  metadata block (Title/Author/Release date/Credits), and START/END markers
+  inside `<section id="pg-header">`/`<section id="pg-footer">`. The original
+  notebook's regex-only cleaning ran *after* flattening to text and never
+  actually strips most of that block — verified this by running the
+  original pipeline against your real file: it left ~500 words of license
+  text and metadata prepended to the first chunk of every book. `gutenberg_data.py`
+  now removes those `<section>` elements from the HTML tree first, then still
+  runs the regex pass afterward as a second layer (for anything missed, and
+  as the only cleaning for older Gutenberg HTML that doesn't use these
+  semantic wrappers). See "What I verified" below for the actual before/after.
+- **Checkpointing throughout**, since a full Gutenberg training run can take
+  a long time and any one of these stages failing shouldn't mean starting
+  over:
+  - `load_or_build_chunks_df` (HTML cleaning) checkpoints every N books.
+  - `cache_features` (style features) and `cache_use_embeddings` (USE
+    embeddings) checkpoint every N items/batches.
+  - The **training loop** checkpoints every epoch (full state: model,
+    optimizer, scheduler, epoch number, loss history) to
+    `checkpoints/latest.pth`, and **auto-resumes from it** the next time you
+    run the same command — no flag needed. Pass `--fresh_start` to discard
+    an existing checkpoint and retrain from epoch 1. A resume is checked
+    against the architecture/data settings the checkpoint was trained with
+    (`use_dim`, `style_in_dim`, `out_dim`, `hidden`, `n_authors`) — a
+    mismatch (e.g. `--hidden` changed, or the corpus gained authors) raises
+    a clear error instead of silently loading the wrong-shaped weights.
 - **Removed a dummy-data bug**: the notebook's stylistic-feature-prediction
   eval cell had `Y_style = np.random.rand(512, 300)` — literally random
   noise standing in for real style features, disconnected from anything
   real. That eval isn't reproduced here; it wasn't needed for producing
   author/document embeddings and shouldn't be trusted as it was written.
   Happy to rebuild it properly against real `style_feats` if you want it.
+- **Removed** `drive.mount`, `!pip install` magics (see `requirements.txt`
+  instead), and hardcoded `/content/drive/...` paths — everything is a
+  `--flag` now.
 - **Chunk-level retrieval stays chunk-level** — no mean-pooling into one
   vector per novel (per your call: pooling loses information). A book's
   rank comes from how many of its chunks land in the ANN neighbor set for
@@ -111,16 +139,21 @@ vades_run/
   gutenberg_chunks.csv        cached cleaned+chunked corpus
   splits/                     cached book-level train/val/test split
   feat_cache/                 cached style features + USE embeddings per split
-  checkpoints/best.pth        VADES_Fuse weights
+  checkpoints/best.pth        VADES_Fuse weights (best val loss)
+  checkpoints/latest.pth      full resumable training state — safe to interrupt
   style_scaler.joblib         mean/std for the handcrafted style features
   vades_faiss_store/          chunk-level FAISS index + metadata  <- "the database"
   author_vectors.npy          learned per-author style embeddings
   author2id.json              author name -> row index into author_vectors
 ```
 
-Everything is cached at each stage (chunks, splits, features, embeddings),
-so re-running after adding a `--genre_csv` you didn't have the first time,
-or after adding new books, only recomputes what changed.
+Every stage is checkpointed (see "What changed" above), so:
+- Interrupting mid-run and re-running the **exact same command** resumes
+  automatically, whichever stage it was in — HTML cleaning, feature/embedding
+  extraction, or the training loop itself.
+- Re-running after adding a `--genre_csv` you didn't have the first time, or
+  after adding new books, only recomputes what actually changed.
+- Want to discard a checkpoint and retrain clean instead? Pass `--fresh_start`.
 
 A quick nearest-author-centroid accuracy is printed after training (against
 the held-out test split) as a sanity check that the model actually learned
@@ -199,13 +232,33 @@ recs = recommender.recommend(author_name="Edgar Allan Poe", genre="Horror", top_
 ## What I verified before handing this off
 
 Since I can't reach `tfhub.dev` or `gutenberg.org` from this environment, I
-built a small synthetic Gutenberg-shaped corpus (multiple authors, multiple
-books each, HTML with real Gutenberg boilerplate) and a stand-in for the USE
+built a small synthetic Gutenberg-shaped corpus and a stand-in for the USE
 model, then ran the *entire* pipeline against it: HTML extraction → cleaning
 → chunking → book-level split → style features → (stubbed) embeddings →
-VADES_Fuse training (loss decreases correctly) → checkpoint save/reload →
-FAISS store export → loading that store back into `VADESStyleRecommender` →
-querying it, including the genre filter and the same-author exclusion edge
-case. All of that ran correctly end-to-end. The one thing this can't verify
-is the real USE model's actual embedding quality or real training dynamics
-at scale — that only shows up once you run it against your real corpus.
+VADES_Fuse training → checkpoint save/reload → FAISS store export → loading
+that store back into `VADESStyleRecommender` → querying it. Specifically for
+this round of changes:
+
+- **HTML cleaning**: reconstructed a test file using the *actual*
+  `<section id="pg-header">`/`<section id="pg-footer">` markup from your
+  `pg11870-images.html` (verbatim boilerplate structure, real story text).
+  Confirmed the new structural cleaning produces zero leakage of license
+  text or metadata (`Release date`, `Credits`, `Title`, etc. all absent from
+  the cleaned output), and separately confirmed the *original* notebook's
+  regex-only approach, run against the same file, leaves ~500 words of that
+  boilerplate in the first chunk of every book.
+- **Checkpointing**: for each of `load_or_build_chunks_df`, `cache_features`,
+  and `cache_use_embeddings`, simulated a crash partway through, confirmed
+  the partial checkpoint was written, then confirmed resuming produced
+  output identical to an uninterrupted run.
+- **Training checkpointing**: ran a 5-epoch training run with a simulated
+  crash after epoch 2, confirmed re-running the same command auto-resumes
+  from epoch 3 with the optimizer/scheduler state intact (loss trajectory
+  continues rather than restarting). Separately confirmed that resuming
+  with a changed `--hidden` value correctly raises the architecture-mismatch
+  error instead of silently loading mismatched weights, and that
+  `--fresh_start` correctly bypasses an existing checkpoint.
+
+The one thing none of this can verify is the real USE model's actual
+embedding quality or real training dynamics at scale — that only shows up
+once you run it against your real corpus.

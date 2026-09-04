@@ -21,6 +21,8 @@ import spacy
 import textstat
 from tqdm import tqdm
 
+from checkpointing import save_partial, load_partial, clear_partial
+
 FUNCTION_WORDS = ["the", "be", "to", "of", "and", "a", "in", "that", "have", "i", "it", "for", "not",
                   "on", "with", "he", "as", "you", "do", "at", "this", "but", "his", "by", "from",
                   "they", "we", "say", "her", "she", "or", "an", "will", "my", "one", "all", "would",
@@ -142,14 +144,41 @@ def build_style_vector(text: str, nlp, dim: int = 300) -> np.ndarray:
     return np.array(feats, dtype=np.float32)
 
 
-def cache_features(df, path: str, nlp, text_col: str = "text") -> np.ndarray:
+def cache_features(df, path: str, nlp, text_col: str = "text",
+                    checkpoint_every: int = 500) -> np.ndarray:
+    """
+    Checkpointed: on a large corpus this is one of the slower stages (spaCy
+    parsing per chunk), so progress is saved every `checkpoint_every` chunks
+    to "<path>.partial.joblib". An interrupted run resumes from there instead
+    of recomputing every feature vector from scratch.
+    """
     if os.path.exists(path):
         print(f"Loading cached features from {os.path.basename(path)}")
         return joblib.load(path)
-    feats = [build_style_vector(t, nlp) for t in tqdm(df[text_col], desc="Style features")]
+
+    ckpt_path = path + ".partial.joblib"
+    state = load_partial(ckpt_path)
+    if state is not None:
+        feats = state["feats"]
+        start_idx = state["next_idx"]
+        print(f"Resuming feature extraction from checkpoint: {start_idx}/{len(df)} done")
+    else:
+        feats, start_idx = [], 0
+
+    texts = df[text_col].tolist()
+    since_checkpoint = 0
+    for i in tqdm(range(start_idx, len(texts)), desc="Style features",
+                  initial=start_idx, total=len(texts)):
+        feats.append(build_style_vector(texts[i], nlp))
+        since_checkpoint += 1
+        if since_checkpoint >= checkpoint_every:
+            save_partial(ckpt_path, {"feats": feats, "next_idx": i + 1})
+            since_checkpoint = 0
+
     feats = np.stack(feats)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     joblib.dump(feats, path)
+    clear_partial(ckpt_path)
     return feats
 
 

@@ -6,17 +6,20 @@ Trains VADES_Fuse (document + author style embeddings) on the Project
 Gutenberg corpus and exports everything the RAG pipeline
 (style_faiss_index.py / style_recommender.py / pipeline.py) needs to run:
 
-    <output_dir>/vades_faiss_store/    chunk-level FAISS index + metadata
-                                        (this is "the database" — same corpus
-                                        used for training now backs retrieval)
-    <output_dir>/author_vectors.npy    learned per-author style embeddings
-    <output_dir>/author2id.json        author name -> row index into author_vectors
-    <output_dir>/checkpoints/best.pth  VADES_Fuse model weights
-    <output_dir>/style_scaler.joblib   mean/std used to scale handcrafted style
-                                        features (needed to featurize any NEW
-                                        text consistently at inference time)
+    <output_dir>/vades_faiss_store/     chunk-level FAISS index + metadata
+                                         (this is "the database" — same corpus
+                                         used for training now backs retrieval)
+    <output_dir>/author_vectors.npy     learned per-author style embeddings
+    <output_dir>/author2id.json         author name -> row index into author_vectors
+    <output_dir>/checkpoints/best.pth   VADES_Fuse weights only (best val loss so far)
+    <output_dir>/checkpoints/latest.pth full resumable training state (model +
+                                         optimizer + scheduler + epoch + loss
+                                         history) — see "Checkpointing" below
+    <output_dir>/style_scaler.joblib    mean/std used to scale handcrafted style
+                                         features (needed to featurize any NEW
+                                         text consistently at inference time)
 
-Fixes applied vs. the original notebook (vades_main.py):
+Fixes/additions vs. the original notebook (vades_main.py):
   - DocDataset/DataLoader ordering: the notebook created train_loader before
     DocDataset was even defined — it only ran because Colab executes cells
     out of the order they're printed in. This script defines things in real
@@ -28,11 +31,39 @@ Fixes applied vs. the original notebook (vades_main.py):
     it rebuilt against real style_feats.
   - Colab-specific bits (drive.mount, `!pip install` magics) removed — see
     requirements.txt for the equivalent installs.
+  - HTML cleaning now strips Project Gutenberg's boilerplate structurally
+    (by <section id="pg-header">/<section id="pg-footer">) before flattening
+    to text, rather than only via regex afterwards — verified against your
+    actual pg11870-images.html sample, where the old regex-only approach left
+    ~500 words of license text and metadata in the first chunk of every book.
+    See gutenberg_data.py.
+  - Checkpointing throughout: corpus cleaning, style-feature extraction, and
+    USE embedding extraction each resume from partial progress instead of
+    starting over (see gutenberg_data.py / style_features.py / embeddings.py).
+    The training loop itself now also checkpoints every epoch and resumes
+    automatically if interrupted — see "Checkpointing" below.
+
+Checkpointing (training loop)
+------------------------------
+After every epoch, full training state (model, optimizer, scheduler, epoch
+number, best validation loss, loss history) is saved to
+checkpoints/latest.pth. If that file exists the next time you run this
+script with the same output_dir, training resumes from the next epoch
+automatically — no flag needed. To ignore an existing checkpoint and retrain
+from scratch instead, pass --fresh_start.
+
+A resumed run is checked against the architecture/data settings the
+checkpoint was originally trained with (use_dim, style_in_dim, out_dim,
+hidden, n_authors) — a mismatch (e.g. you changed --hidden, or the corpus
+gained new authors) raises a clear error rather than silently loading
+mismatched weights or crashing deep inside torch's state_dict loading.
 
 Usage:
     python train_vades.py --books_dir /path/to/gutenberg_books --output_dir ./vades_run
     python train_vades.py --books_dir /path/to/gutenberg_books --output_dir ./vades_run \\
         --genre_csv book_genres.csv --epochs 15
+    # interrupted? just run the exact same command again — it resumes.
+    python train_vades.py --books_dir /path/to/gutenberg_books --output_dir ./vades_run --fresh_start
 """
 
 import argparse
@@ -48,6 +79,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from checkpointing import atomic_write
 from gutenberg_data import load_or_build_chunks_df, book_level_split
 from style_features import load_spacy_model, cache_features, fit_scaler, apply_scaler, save_scaler
 from embeddings import load_use_model, cache_use_embeddings
@@ -75,6 +107,8 @@ def parse_args():
     p.add_argument("--margin", type=float, default=0.2)
     p.add_argument("--alpha", type=float, default=0.8)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--fresh_start", action="store_true",
+                   help="Ignore any existing checkpoints/latest.pth and retrain from epoch 1.")
     return p.parse_args()
 
 
@@ -149,7 +183,7 @@ def main():
                               num_workers=2, pin_memory=True)
 
     # ---------------------------------------------------------------
-    # 6. Model, optimizer, training loop
+    # 6. Model, optimizer, training loop (checkpointed + resumable)
     # ---------------------------------------------------------------
     model = VADES_Fuse(use_dim=train_embs.shape[1], style_in_dim=train_feats.shape[1],
                         out_dim=args.out_dim, hidden=args.hidden, n_authors=num_authors,
@@ -157,10 +191,36 @@ def main():
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
 
-    best_val = float("inf")
-    best_ckpt = os.path.join(ckpt_dir, "best.pth")
+    arch_signature = {
+        "use_dim": int(train_embs.shape[1]),
+        "style_in_dim": int(train_feats.shape[1]),
+        "out_dim": args.out_dim,
+        "hidden": args.hidden,
+        "n_authors": num_authors,
+    }
 
-    for epoch in range(1, args.epochs + 1):
+    best_ckpt = os.path.join(ckpt_dir, "best.pth")
+    latest_ckpt = os.path.join(ckpt_dir, "latest.pth")
+
+    best_val = float("inf")
+    loss_history = {"train": [], "val": []}
+    start_epoch = 1
+
+    if os.path.exists(latest_ckpt) and not args.fresh_start:
+        print(f"Found existing checkpoint at {latest_ckpt} — resuming.")
+        resumed_epoch, best_val, loss_history = _load_training_checkpoint(
+            latest_ckpt, model, optimizer, scheduler, device, arch_signature
+        )
+        start_epoch = resumed_epoch + 1
+        print(f"Resuming from epoch {start_epoch} (best_val so far: {best_val:.4f})")
+    elif os.path.exists(latest_ckpt) and args.fresh_start:
+        print(f"--fresh_start given: ignoring existing checkpoint at {latest_ckpt}.")
+
+    if start_epoch > args.epochs:
+        print(f"Checkpoint is already at epoch {start_epoch - 1}/{args.epochs} — nothing left "
+              f"to train. Raise --epochs to continue training, or pass --fresh_start to retrain.")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         train_losses = []
         for use_emb, style_feat, aid in train_loader:
@@ -190,18 +250,31 @@ def main():
                 val_losses.append(vloss.item())
 
         avg_train, avg_val = float(np.mean(train_losses)), float(np.mean(val_losses))
+        loss_history["train"].append(avg_train)
+        loss_history["val"].append(avg_val)
         print(f"[Epoch {epoch}/{args.epochs}] train={avg_train:.4f} val={avg_val:.4f}")
         scheduler.step(avg_val)
 
         if avg_val < best_val:
             best_val = avg_val
             torch.save(model.state_dict(), best_ckpt)
-            print(f"  -> saved {best_ckpt}")
+            print(f"  -> new best, saved {best_ckpt}")
+
+        # Full resumable state, every epoch — this is what makes a crash or
+        # interrupt partway through a long training run non-fatal.
+        _save_training_checkpoint(latest_ckpt, epoch, model, optimizer, scheduler,
+                                   best_val, loss_history, arch_signature)
 
     # ---------------------------------------------------------------
     # 7. Reload best checkpoint, quick sanity check before trusting these
     #    embeddings to build a recommender on
     # ---------------------------------------------------------------
+    if not os.path.exists(best_ckpt):
+        raise RuntimeError(
+            f"No {best_ckpt} was ever saved (no epoch improved on the initial best_val=inf). "
+            f"This shouldn't normally happen — check the training loop actually ran at least "
+            f"one epoch (start_epoch/--epochs) and that val loss isn't NaN."
+        )
     model.load_state_dict(torch.load(best_ckpt, map_location=device))
     model.eval()
     _report_nearest_author_accuracy(model, train_loader, test_loader, num_authors, device)
@@ -238,12 +311,56 @@ def main():
     print(f"  - author_vectors.npy   {author_vectors.shape}")
     print(f"  - author2id.json       ({num_authors} authors)")
     print(f"  - checkpoints/best.pth")
+    print(f"  - checkpoints/latest.pth (resumable training state)")
     print(f"  - style_scaler.joblib  (needed to featurize any NEW text at inference time)")
     if not args.genre_csv:
         print(f"\nNOTE: no --genre_csv was given, so every chunk was indexed with an empty "
               f"genre list. Genre-filtered search will return nothing until you tag books "
               f"(see book_genres_template.csv) and rebuild the index (Step 8 can be re-run "
               f"on its own — see README).")
+
+
+def _save_training_checkpoint(path, epoch, model, optimizer, scheduler, best_val,
+                               loss_history, arch_signature):
+    """Full resumable training state — everything needed to pick up training
+    at the next epoch as if it had never stopped. Atomic write (see
+    checkpointing.py) so a crash mid-save can't leave a corrupt checkpoint
+    that then fails to load on the next resume attempt."""
+    state = {
+        "epoch": epoch,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
+        "best_val": best_val,
+        "loss_history": loss_history,
+        "arch": arch_signature,
+    }
+    atomic_write(path, lambda tmp: torch.save(state, tmp))
+
+
+def _load_training_checkpoint(path, model, optimizer, scheduler, device, arch_signature):
+    """Loads a training checkpoint IN PLACE into model/optimizer/scheduler.
+    Refuses to load if the checkpoint's architecture/data settings
+    (use_dim, style_in_dim, out_dim, hidden, n_authors) don't match the
+    current run's — silently loading mismatched weights would either crash
+    deep inside torch with a confusing shape error, or worse, load
+    successfully into the wrong-shaped layers and train garbage."""
+    state = torch.load(path, map_location=device)
+    saved_arch = state.get("arch", {})
+    mismatches = {k: (saved_arch.get(k), v) for k, v in arch_signature.items()
+                  if saved_arch.get(k) != v}
+    if mismatches:
+        raise ValueError(
+            f"Checkpoint at {path} was trained with different settings than this run "
+            f"(saved vs. current): {mismatches}. This usually means the corpus changed "
+            f"(different n_authors) or a --hidden/--out_dim flag changed between runs. "
+            f"Either match the original settings again, or pass --fresh_start to discard "
+            f"the checkpoint and retrain from scratch."
+        )
+    model.load_state_dict(state["model_state"])
+    optimizer.load_state_dict(state["optimizer_state"])
+    scheduler.load_state_dict(state["scheduler_state"])
+    return state["epoch"], state["best_val"], state["loss_history"]
 
 
 def _extract_embeddings(model, use_arr, style_arr, device, batch=256):
