@@ -119,6 +119,12 @@ comma-separated genres in a single row). Books without a row here are
 indexed with an empty genre list and are invisible to genre-filtered search
 until tagged — you'll get a warning listing which ones at build time.
 
+A query genre can name several tags at once: `"gothic horror"` (or
+`"Gothic, Horror"`) matches books tagged with **both** Gothic and Horror.
+An exact multi-word tag such as `"Comedy of Manners"` still matches as one
+tag. If any word of the phrase isn't a known tag (`"gothic thriller"`), the
+search returns nothing rather than quietly broadening to just Gothic.
+
 ## Step 3 — Train + build the database in one command
 
 ```bash

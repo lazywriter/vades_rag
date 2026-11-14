@@ -10,6 +10,7 @@ tqdm
 joblib
 tensorflow
 tensorflow-hub
+setuptools<81   # tensorflow-hub 0.16.x imports pkg_resources, which setuptools>=81 removed
 # tensorflow-text  # uncomment if your USE variant needs it (not required for
                     # universal-sentence-encoder/4, the one used by default)
 

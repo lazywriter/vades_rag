@@ -38,7 +38,11 @@ def run_query(query_text: str, recommender: VADESStyleRecommender,
     Returns:
         List of dicts: title, author, genres, match_count, avg_similarity, explanation
     """
-    client = client or anthropic.Anthropic()
+    # Only build a client if something will actually call the API, so the
+    # fully offline path (use_llm_parser=False, generate_explanations=False)
+    # needs no credentials on any SDK version.
+    if client is None and (use_llm_parser or generate_explanations):
+        client = anthropic.Anthropic()
 
     if use_llm_parser:
         parsed = parse_query_llm(query_text, client=client)

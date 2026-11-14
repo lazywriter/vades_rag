@@ -112,9 +112,11 @@ def build_style_vector(text: str, nlp, dim: int = 300) -> np.ndarray:
 
     top = [g for g, _ in char_ng.most_common(50)]
     tot = max(1, sum(char_ng.values()))
-    feats += [char_ng.get(g, 0) / tot for g in top]
-    if len(feats) < 85 + 50:
-        feats += [0.0] * (85 + 50 - len(feats))
+    # Pad each n-gram block to exactly 50 so every later feature keeps a fixed
+    # index. (The old fixed targets, 135 and 185, assumed 85 features before
+    # this block; there are 113, so for short texts with <50 distinct n-grams
+    # the distributional/extra features silently shifted position.)
+    feats += [char_ng.get(g, 0) / tot for g in top] + [0.0] * (50 - len(top))
 
     # Word bigrams (50)
     word_bg = Counter()
@@ -122,9 +124,7 @@ def build_style_vector(text: str, nlp, dim: int = 300) -> np.ndarray:
         word_bg[" ".join(word_lower[i:i + 2])] += 1
     top = [g for g, _ in word_bg.most_common(50)]
     tot = max(1, sum(word_bg.values()))
-    feats += [word_bg.get(g, 0) / tot for g in top]
-    if len(feats) < 185:
-        feats += [0.0] * (185 - len(feats))
+    feats += [word_bg.get(g, 0) / tot for g in top] + [0.0] * (50 - len(top))
 
     # Distributional (2)
     probs = np.array([v / max(1, sum(wc.values())) for v in wc.values()], dtype=float)

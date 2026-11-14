@@ -46,11 +46,19 @@ def explain_recommendation(target_author: str, rec: BookRecommendation,
     )
     resp = client.messages.create(
         model=model,
-        max_tokens=100,
+        # Headroom, not the expected length (the prompt already asks for one
+        # <=30-word sentence): thinking tokens count toward max_tokens on
+        # current models, and the old cap of 100 could leave no room for text.
+        max_tokens=1024,
         system=EXPLAIN_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_msg}],
     )
-    return "".join(b.text for b in resp.content if b.type == "text").strip()
+    text = "".join(b.text for b in resp.content if b.type == "text").strip()
+    if resp.stop_reason in ("refusal", "max_tokens") or not text:
+        # One missing explanation shouldn't sink the whole result list (the
+        # ranking is already decided); say so visibly instead of returning "".
+        return f"(no explanation available: model stopped with stop_reason={resp.stop_reason!r})"
+    return text
 
 
 def explain_all(target_author: str, recs: List[BookRecommendation],

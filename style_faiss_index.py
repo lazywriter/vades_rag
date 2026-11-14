@@ -25,6 +25,7 @@ NOT inferred by this code. See `load_genre_map` for the expected CSV format.
 """
 
 import os
+import re
 import numpy as np
 import pandas as pd
 import faiss
@@ -130,19 +131,59 @@ def build_faiss_index(embeddings, already_normalized=True):
     return index
 
 
+# Words a free-text genre phrase may carry that aren't genre tags themselves
+# ("gothic horror novels", "mystery fiction").
+_GENRE_FILLER_WORDS = {"and", "or", "novel", "novels", "fiction", "book", "books",
+                       "story", "stories", "literature", "genre"}
+
+
+def resolve_genre_tags(genre, known_tags):
+    """
+    Maps a genre phrase to the set of assigned tags it names (lowercased).
+
+    - An exact tag match wins ("Comedy of Manners" -> ["comedy of manners"]).
+    - Otherwise the phrase is decomposed into known tags, longest tag first,
+      so "gothic horror" -> ["gothic", "horror"] when books are tagged with
+      Gothic and Horror separately (how book_genres_template.csv tags them).
+      Separators (",", "/", "&", "+", "-") and filler words like "novels" are
+      ignored.
+    - Returns [] if any part of the phrase isn't a known tag, rather than
+      silently dropping it and searching a broader genre than was asked for.
+    """
+    norm = genre.strip().lower()
+    known = {t.strip().lower() for t in known_tags}
+    if norm in known:
+        return [norm]
+
+    # Hyphens are kept while matching (so a "sci-fi" tag still matches) and
+    # only treated as separators for whatever is left over afterwards.
+    remaining = " " + re.sub(r"[,/&+]", " ", norm) + " "
+    found = []
+    for tag in sorted(known, key=len, reverse=True):
+        pattern = r"(?<!\w)" + re.escape(tag) + r"(?!\w)"
+        if re.search(pattern, remaining):
+            found.append(tag)
+            remaining = re.sub(pattern, " ", remaining)
+    leftover = [w for w in re.split(r"[\s\-]+", remaining)
+                if w and w not in _GENRE_FILLER_WORDS]
+    return found if found and not leftover else []
+
+
 def genre_selector(metadata_df, genre):
     """
     Builds a faiss.IDSelectorArray restricting search to chunks whose book is
-    tagged with `genre` (case-insensitive, exact tag match against the tags
-    you assigned via load_genre_map).
+    tagged with `genre` (case-insensitive, matched against the tags you
+    assigned via load_genre_map). A compound phrase such as "gothic horror"
+    matches books carrying ALL of its tags — see resolve_genre_tags.
 
     Returns (selector, matching_chunk_ids). If no chunks match, matching_chunk_ids
     is empty — callers should check for that (e.g. VADESStyleRecommender.recommend
     returns [] and prints a warning rather than silently searching everything).
     """
-    genre_lower = genre.strip().lower()
+    known_tags = {g for gs in metadata_df["genres"] for g in gs}
+    wanted = set(resolve_genre_tags(genre, known_tags))
     mask = metadata_df["genres"].apply(
-        lambda gs: any(g.lower() == genre_lower for g in gs)
+        lambda gs: bool(wanted) and wanted <= {g.lower() for g in gs}
     )
     matching_ids = metadata_df.loc[mask, "chunk_id"].to_numpy().astype(np.int64)
     selector = faiss.IDSelectorArray(matching_ids)

@@ -72,7 +72,9 @@ def extract_text_from_html(path: str) -> str:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         soup = BeautifulSoup(f, "html.parser")
 
-    for tag in soup(["table", "script", "style"]):
+    # "head" too: otherwise the <title> ("X, by Author") is prepended to the
+    # first chunk of every book.
+    for tag in soup(["head", "table", "script", "style"]):
         tag.extract()
 
     # Structural removal: current Gutenberg HTML wraps the ENTIRE license
@@ -86,7 +88,11 @@ def extract_text_from_html(path: str) -> str:
     for el in soup.find_all(class_=PG_BOILERPLATE_CLASS):
         el.extract()
 
-    return soup.get_text(separator=" ", strip=True)
+    # "\n" (not " ") between text nodes so line-oriented cleanup in
+    # clean_gutenberg_text (e.g. the "Produced by ..." credit line) has a line
+    # end to stop at. clean_gutenberg_text collapses all whitespace at the end,
+    # so the final text is unchanged by this choice.
+    return soup.get_text(separator="\n", strip=True)
 
 
 def clean_gutenberg_text(text: str) -> str:
@@ -98,12 +104,24 @@ def clean_gutenberg_text(text: str) -> str:
     caught everything, this mostly just tidies whitespace and stray
     "CHAPTER"/markdown-style separators inside the body text.
     """
-    text = re.sub(r'(?is).*?(the project gutenberg ebook of )', '', text, count=1)
-    text = re.sub(r'(?is)\*\*\*\s*start of (the|this) project gutenberg ebook.*?\*\*\*', '',
+    # \A anchor: without it, when the phrase is absent (the normal case once
+    # extract_text_from_html has removed pg-header) the regex engine retries
+    # the lazy .*? from every start position -> O(n^2), ~hours per real book.
+    # Matches are identical, since any match would start at position 0 anyway.
+    text = re.sub(r'(?is)\A.*?(the project gutenberg ebook of )', '', text, count=1)
+    # Drop everything up to and including the START marker, not just the marker
+    # itself: in older Gutenberg files (no pg-header <section>) the license
+    # blurb and Title/Author/Release Date block sit *before* this marker.
+    # \A-anchored for the same linear-time reason as the line above.
+    text = re.sub(r'(?is)\A.*?\*\*\*\s*start of (the|this) project gutenberg ebook.*?\*\*\*', '',
                    text, count=1)
     text = re.sub(r'(?is)end of (the|this) project gutenberg ebook.*', '', text)
     text = re.sub(r'(?is)\*\*\*.*?project gutenberg.*?\*\*\*', '', text)
-    text = re.sub(r'(?i)(produced by|transcribed from).*?\n', '', text)
+    # Credit line only where it actually appears in older files: right at the
+    # start, after the header/START marker removal above. Unanchored, this
+    # deleted ordinary prose (e.g. "...produced by velvet wrapping, the
+    # crystal did" in The Crystal Egg, pg11870).
+    text = re.sub(r'(?i)\A\s*(produced by|transcribed from)[^\n]*', '', text)
     text = re.sub(r'\b(CHAPTER|Chapter)\s+[A-Z0-9IVX]+\b', '', text)
     text = re.sub(r'[_*#~-]{2,}', ' ', text)
     text = re.sub(r'http\S+', '', text)

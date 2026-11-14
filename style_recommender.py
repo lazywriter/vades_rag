@@ -137,7 +137,9 @@ class VADESStyleRecommender:
         if genre is not None:
             selector, candidate_chunk_ids = genre_selector(self.metadata_df, genre)
             if len(candidate_chunk_ids) == 0:
-                print(f"No chunks are tagged with genre '{genre}'. Returning no results.")
+                known = sorted({g for gs in self.metadata_df["genres"] for g in gs})
+                print(f"No chunks are tagged with genre '{genre}'. Returning no results. "
+                      f"Known genre tags: {known}")
                 return []
             universe_size = len(candidate_chunk_ids)
 

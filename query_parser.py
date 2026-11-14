@@ -50,20 +50,32 @@ def parse_query_llm(query: str, client: Optional["anthropic.Anthropic"] = None,
         {"author": str|None, "genre": str|None, "top_k": int}
 
     Raises:
-        json.JSONDecodeError if the model didn't return valid JSON (rare, but
-        don't blindly trust LLM output in a pipeline — check for this upstream).
+        ValueError if the model stopped without a complete answer (refusal,
+        or hit max_tokens) or didn't return valid JSON — don't blindly trust
+        LLM output in a pipeline.
     """
     client = client or anthropic.Anthropic()
     resp = client.messages.create(
         model=model,
-        max_tokens=200,
+        # Headroom, not the expected answer length: current models think
+        # adaptively by default and thinking tokens count toward max_tokens,
+        # so a tight cap (this used to be 200) can cut the JSON off mid-way.
+        max_tokens=1024,
         system=PARSE_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": query}],
     )
+    if resp.stop_reason in ("refusal", "max_tokens"):
+        raise ValueError(f"Query parser got no complete answer from the model "
+                         f"(stop_reason={resp.stop_reason!r}) for query {query!r}")
     text = "".join(block.text for block in resp.content if block.type == "text").strip()
     text = re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
-    parsed = json.loads(text)
-    if not parsed.get("top_k"):
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Query parser expected JSON from the model, got: {text[:200]!r}") from e
+    try:
+        parsed["top_k"] = int(parsed.get("top_k") or 5)
+    except (TypeError, ValueError):
         parsed["top_k"] = 5
     return parsed
 
@@ -75,19 +87,35 @@ def parse_query_fallback(query: str, known_authors: List[str],
     known vocab. Use as an offline fallback, or to cross-check the LLM
     parser's output for a quick sanity test.
 
-    Note: this does simple substring matching, so it works best when
-    known_authors/known_genres are checked longest-first (to avoid e.g.
-    matching "Poe" inside a longer name first) and won't catch paraphrases
-    the LLM parser would (e.g. "detective fiction" -> "Mystery").
+    Note: this does word-bounded string matching (longest known name/genre
+    first), so it won't catch paraphrases the LLM parser would (e.g.
+    "detective fiction" -> "Mystery").
     """
     q_lower = query.lower()
 
-    author = next((a for a in sorted(known_authors, key=len, reverse=True)
-                   if a.lower() in q_lower), None)
-    genre = next((g for g in sorted(known_genres, key=len, reverse=True)
-                  if g.lower() in q_lower), None)
+    def _word_pattern(term: str) -> str:
+        # word-bounded, so e.g. "Poe" doesn't match inside "poetry"
+        return r"(?<!\w)" + re.escape(term.lower()) + r"(?!\w)"
 
-    m = re.search(r"\btop\s*(\d+)\b|\b(\d+)\s+novels?\b", q_lower)
+    author = next((a for a in sorted(known_authors, key=len, reverse=True)
+                   if re.search(_word_pattern(a), q_lower)), None)
+
+    # Collect EVERY known genre named (longest first, consuming matched text so
+    # "Gothic" isn't re-found inside an already-matched "Gothic Horror" tag),
+    # kept in the order they appear. Several genres come back comma-joined,
+    # e.g. "Gothic, Horror", which genre_selector reads as "tagged with all".
+    remaining, hits = q_lower, []
+    for g in sorted(known_genres, key=len, reverse=True):
+        m = re.search(_word_pattern(g), remaining)
+        if m:
+            hits.append((m.start(), g))
+            remaining = remaining[:m.start()] + " " * len(m.group()) + remaining[m.end():]
+    genre = ", ".join(g for _, g in sorted(hits)) or None
+
+    # "top 5", or a count up to 4 words before novels/books ("4 gothic horror novels")
+    m = re.search(r"\btop\s*(\d+)\b"
+                  r"|\b(\d+)\b(?=(?:\s+[\w'-]+){0,4}?\s+(?:novels?|books?|titles?)\b)",
+                  q_lower)
     top_k = int(m.group(1) or m.group(2)) if m else 5
 
     return {"author": author, "genre": genre, "top_k": top_k}
